@@ -4,11 +4,9 @@ import com.mitchellbosecke.pebble.error.PebbleException;
 import org.apache.http.HttpEntity;
 import org.apache.http.HttpResponse;
 import org.apache.http.client.HttpClient;
-import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.entity.mime.MultipartEntityBuilder;
 import org.apache.http.impl.client.HttpClients;
-import org.apache.http.util.EntityUtils;
 
 import javax.servlet.ServletContext;
 import java.io.IOException;
@@ -21,6 +19,7 @@ import java.util.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class WiiConnect24Api extends WC24Base {
 
@@ -35,13 +34,34 @@ public class WiiConnect24Api extends WC24Base {
      * @param mails
      * @return
      * @throws IOException
+     * @throws InterruptedException
      */
-    public String sendMails(List<MailItem> mails) throws IOException {
+    public String sendMails(List<MailItem> mails) throws IOException, InterruptedException {
 
+        String output = "";
+
+        // If the mail list is too long it'll likely overload the WC24 endpoint
+        // Split the list into 15s (max amount) and perform an equal number of requests
+        final AtomicInteger counter = new AtomicInteger();
+        final java.util.Collection<List<MailItem>> chunkedMails = mails.stream()
+                .collect(Collectors.groupingBy(it -> counter.getAndIncrement() / 15))
+                .values();
+
+        for (List<MailItem> chunk : chunkedMails) {
+            output += sendMailsInternal(chunk);
+            // Sleep between chunks to avoid murdering the RC24 server :|
+            Thread.sleep(1000);
+            output += "----------------\n";
+        }
+
+        return output;
+    }
+
+    private String sendMailsInternal(List<MailItem> mails) throws IOException {
         Logger log = Logger.getLogger("WC24");
 
         HttpClient httpclient = HttpClients.createDefault();
-        HttpPost httppost = new HttpPost("http://mtw." + wc24Server + "/cgi-bin/send.cgi");
+        HttpPost request = new HttpPost("http://mtw." + wc24Server + "/cgi-bin/send.cgi");
 
         // Request parameters and other properties.
         MultipartEntityBuilder builder = MultipartEntityBuilder.create();
@@ -67,26 +87,26 @@ public class WiiConnect24Api extends WC24Base {
         }
 
         HttpEntity formDataEntity = builder.build();
-        httppost.setEntity(formDataEntity);
+        request.setEntity(formDataEntity);
 
-        /*
-        // Log full multipart request 
-        // Commented out as it makes the logs gigantic 
-        try {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            builder.build().writeTo(baos);
+        // Log full multipart request, if thou must
+        // It makes the logs gigantic
+        if (debugLogging) {
 
-            log.log(Level.INFO, "Executing request:" + System.lineSeparator() 
-            + httppost.getRequestLine() + System.lineSeparator()
-            + baos.toString());
+            try {
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                builder.build().writeTo(baos);
+
+                log.log(Level.INFO, "Executing request:" + System.lineSeparator()
+                        + request.getRequestLine() + System.lineSeparator()
+                        + baos.toString());
+            } catch (Exception e) {
+                log.log(Level.INFO, e.getMessage());
+            }
         }
-        catch (Exception e) {
-            log.log(Level.INFO, e.getMessage() );
-        }
-        */
 
         // Execute and get the response.
-        HttpResponse response = httpclient.execute(httppost);
+        HttpResponse response = httpclient.execute(request);
         HttpEntity entity = response.getEntity();
 
         if (entity != null) {
@@ -107,15 +127,19 @@ public class WiiConnect24Api extends WC24Base {
      * 
      * @throws Exception
      */
-    public void receiveMails() throws Exception {
+    public String receiveMails() throws Exception {
 
         HttpClient httpclient = HttpClients.createDefault();
+        HttpPost request = new HttpPost("http://mtw." + wc24Server + "/cgi-bin/receive.cgi");
 
-        // For receiving, the syntax is different and the mail/password are query
-        // parameters.
-        String authString = "mlid=w" + sender + "&passwd=" + wc24Pass;
-        HttpPost request = new HttpPost(
-                "http://mtw." + wc24Server + "/cgi-bin/receive.cgi?" + authString + "&maxsize=2000000");
+        // For receiving, the syntax is different and the creds are form parameters.
+        MultipartEntityBuilder builder = MultipartEntityBuilder.create();
+        builder.addTextBody("mlid", "w" + sender);
+        builder.addTextBody("passwd", wc24Pass);
+        builder.addTextBody("maxsize", "2000000");
+
+        HttpEntity formDataEntity = builder.build();
+        request.setEntity(formDataEntity);
 
         // Execute and get the response.
         HttpResponse response = httpclient.execute(request);
@@ -126,7 +150,52 @@ public class WiiConnect24Api extends WC24Base {
 
                 String responseText = new BufferedReader(new InputStreamReader(inStream)).lines()
                         .collect(Collectors.joining("\n"));
+
+                if (debugLogging) {
+                    Logger log = Logger.getLogger("WC24 Debug");
+                    log.log(Level.INFO, "Reponse from WC24: \n" + responseText);
+                }
+
                 new MailItemParser(application).consumeEmails(responseText);
+                return "<pre>" + responseText + "</pre>";
+            }
+
+        return "No mails received.";
+    }
+
+    /**
+     * Deletes all received mails from the WiiConnect24 server.
+     * 
+     * @throws Exception
+     */
+    public void deleteMails() throws Exception {
+
+        HttpClient httpclient = HttpClients.createDefault();
+        HttpPost request = new HttpPost("http://mtw." + wc24Server + "/cgi-bin/delete.cgi");
+
+        // For receiving, the syntax is different and the creds are form parameters.
+        MultipartEntityBuilder builder = MultipartEntityBuilder.create();
+        builder.addTextBody("mlid", "w" + sender);
+        builder.addTextBody("passwd", wc24Pass);
+        builder.addTextBody("delnum", "10"); // WiiLink's server doesn't care about this number but needs it
+
+        HttpEntity formDataEntity = builder.build();
+        request.setEntity(formDataEntity);
+
+        // Execute and get the response.
+        HttpResponse response = httpclient.execute(request);
+        HttpEntity entity = response.getEntity();
+
+        if (entity != null)
+            try (InputStream inStream = entity.getContent()) {
+
+                String responseText = new BufferedReader(new InputStreamReader(inStream)).lines()
+                        .collect(Collectors.joining("\n"));
+
+                if (debugLogging) {
+                    Logger log = Logger.getLogger("WC24 Debug");
+                    log.log(Level.INFO, "Reponse from WC24 deletion request: \n" + responseText);
+                }
             }
     }
 }

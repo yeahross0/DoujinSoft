@@ -78,6 +78,18 @@ public class MailItemParser extends WC24Base {
         for (String content : mailItems) {
             try {
 
+                if (content.contains("This part is ignored")) {
+                    // What it says on the tin!
+                    continue;
+                }
+
+                if (content.length() < 30) {
+                    // Skip empty (or mostly-empty) items
+                    // The mails end with "--202409141517/6360705--" whereas the delimiter is
+                    // "--202409141517/6360705" so you'll have some noise at the end
+                    continue;
+                }
+
                 // Strip "Content-Type: text/plain" at the beginning of the item
                 content = content.substring(30);
                 MailItem toSend = analyzeMail(content);
@@ -131,14 +143,22 @@ public class MailItemParser extends WC24Base {
         if (!isFriendCodeSaved(wiiCode)) {
 
             // If the mail is a friend request, handle it
-            if (subject.equals("WC24 Cmd Message")) {
+            if (subject.contains("WC24 Cmd Message")) {
                 log.log(Level.INFO, "Friend request from " + wiiCode);
                 saveFriendCode(wiiCode);
                 return new MailItem(wiiCode);
             } else {
-                // Reject non-friend request mails that don't have a code stored in the Friends table
-                log.log(Level.INFO, "Mail from unregistered Friend Code - Skipping.");
-                return null;
+                // Reject mails that don't have their code stored in the DB - with exceptions.
+                // Note - This was originally implemented to prevent survey spam, so it might be
+                // necessary to re-exclude QUESTION here if that happens again.
+                if (subject.equals("QUESTION") || subject.equals("G") || subject.equals("RR")
+                        || subject.equals("MMM")) {
+                    log.log(Level.INFO, "Unregistered Friend Code yet DIY content - Making an exception...");
+                } else {
+                    log.log(Level.INFO, "Mail from unregistered Friend Code - Skipping.");
+                    return null;
+                }
+
             }
         }
 
@@ -289,9 +309,9 @@ public class MailItemParser extends WC24Base {
 
             PreparedStatement ret = connection.prepareStatement("select COUNT(*) from Friends WHERE friendcode = ?");
             ret.setString(1, code);
-            
+
             ResultSet result = ret.executeQuery();
-		    int res = result.getInt(1);
+            int res = result.getInt(1);
             return (res == 1);
         } catch (SQLException e) {
             return false;
